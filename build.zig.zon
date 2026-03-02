@@ -1,0 +1,24 @@
+.{
+    .name = .wayland,
+    .version = "1.24.0",
+    .fingerprint = 0xa8d655eae909fe1,
+    .minimum_zig_version = "0.16.0-dev.2535+b5bd49460",
+    .dependencies = .{
+        .libffi = .{
+            .url = "https://github.com/allyourcodebase/libffi/archive/refs/tags/v3.5.2.tar.gz",
+            .hash = "libffi-3.5.2-QhHaJ14TAADRonPOrcnDENKGBp8n7fFwV66XkF8xYJ8J",
+        },
+        .libexpat = .{ .path = "../libexpat", .lazy = true },
+        .libxml2 = .{ .path = "../libxml2", .lazy = true },
+        .epoll_shim = .{
+            .url = "https://github.com/allyourcodebase/epoll-shim/archive/refs/tags/v0.0.20240608.tar.gz",
+            .hash = "epoll_shim-0.0.20240608-F353TAwYAADuv8WKH14sMnMpwxCf-WLRPKbPgBPZRusk",
+            .lazy = true,
+        },
+        .upstream = .{
+            .url = "https://gitlab.freedesktop.org/wayland/wayland/-/archive/1.24.0/wayland-1.24.0.tar.gz",
+            .hash = "N-V-__8AAGoeGQBEn6KguTJUXrCE0tIRrrXfQX7hYHoKCJwZ",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "tools", "README.md", "LICENSE" },
+}
