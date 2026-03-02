@@ -1,63 +1,119 @@
 const std = @import("std");
+const path = std.fs.path;
+const LinkMode = std.builtin.LinkMode;
+const Module = std.Build.Module;
+const Compile = std.Build.Step.Compile;
+const LazyPath = std.Build.LazyPath;
+
 const manifest = @import("build.zig.zon");
 
-const version: std.SemanticVersion = .{ .major = 1, .minor = 24, .patch = 0 };
-
-pub fn build(b: *std.Build) void {
+pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-
-    const upstream = b.dependency("upstream", .{});
-    const libffi_dep = b.dependency("libffi", .{ .target = target, .optimize = optimize });
-
     const os = target.result.os.tag;
-    const is_linux = os == .linux;
-    const is_bsd = os.isBSD();
-    const is_freebsd = os == .freebsd;
 
     const options = .{
-        .linkage = b.option(std.builtin.LinkMode, "linkage", "Library linkage type") orelse .static,
-        .scanner = b.option(bool, "scanner", "Compile wayland-scanner") orelse true,
-        .@"dtd-validation" = b.option(bool, "dtd-validation", "Validate the protocol DTD") orelse false,
-        .icon_directory = b.option([]const u8, "icon-directory", "Location for cursors") orelse null,
+        .linkage = b.option(LinkMode, "linkage", "Library linkage type") orelse
+            .static,
+        .scanner = b.option(bool, "scanner", "Compile wayland-scanner") orelse
+            true,
+        .@"dtd-validation" = b.option(bool, "dtd-validation", "Validate the protocol DTD") orelse
+            false,
+        .icon_directory = b.option([]const u8, "icon-directory", "Location for cursors") orelse
+            null,
     };
 
-    const cc_flags = getCCFlags(b, target);
-    const host_cc_flags = getCCFlags(b, b.graph.host);
+    const pkgs = .{
+        .libffi = if (!b.systemIntegrationOption("libffi", .{}))
+            b.lazyDependency("libffi", .{ .target = target, .optimize = optimize })
+        else
+            null,
+        .libexpat = if (options.scanner and !b.systemIntegrationOption("libexpat", .{}))
+            b.lazyDependency("libexpat", .{ .target = b.graph.host, .optimize = optimize })
+        else
+            null,
+        .libxml2 = if (options.scanner and options.@"dtd-validation" and !b.systemIntegrationOption("libxml2", .{}))
+            b.lazyDependency("libxml2", .{ .target = b.graph.host, .optimize = optimize, .minimum = true, .valid = true })
+        else
+            null,
+        .epoll_shim = if (os.isBSD() and !b.systemIntegrationOption("epoll_shim", .{}))
+            b.lazyDependency("epoll_shim", .{ .target = target, .optimize = optimize })
+        else
+            null,
+    };
 
-    // ── Config ───────────────────────────────────────────────────────
+    const upstream = b.dependency("wayland_c", .{});
+    const version: std.SemanticVersion = try .parse(manifest.version);
+    const soversion: std.SemanticVersion = .{ .major = version.major -| 1, .minor = version.minor, .patch = 0 };
+
+    const flags, const host_flags = flags: {
+        const base: []const []const u8 = &.{
+            "-std=c99",
+            "-Wno-unused-parameter",
+            "-Wstrict-prototypes",
+            "-Wmissing-prototypes",
+            "-fvisibility=hidden",
+        };
+
+        const posix: []const []const u8 = &.{"-D_POSIX_C_SOURCE=200809L"};
+
+        break :flags .{
+            if (os.isBSD()) base else base ++ posix,
+            if (b.graph.host.result.os.tag.isBSD()) base else base ++ posix,
+        };
+    };
 
     const config_h = b.addConfigHeader(.{ .include_path = "config.h" }, .{
         .PACKAGE = "wayland",
         .PACKAGE_VERSION = manifest.version,
-        .HAVE_SYS_PRCTL_H = is_linux,
-        .HAVE_SYS_PROCCTL_H = if (is_freebsd) target.result.os.isAtLeast(.freebsd, .{ .major = 10, .minor = 0, .patch = 0 }) orelse false else false,
-        .HAVE_SYS_UCRED_H = is_bsd,
+        .HAVE_SYS_PRCTL_H = opt(os == .linux),
+        .HAVE_SYS_PROCCTL_H = opt(
+            if (os == .freebsd)
+                target.result.os.isAtLeast(.freebsd, .{
+                    .major = 10,
+                    .minor = 0,
+                    .patch = 0,
+                }) orelse false
+            else
+                false,
+        ),
+        .HAVE_SYS_UCRED_H = opt(os.isBSD()),
         .HAVE_ACCEPT4 = true,
-        .HAVE_MKOSTEMP = true,
-        .HAVE_POSIX_FALLOCATE = true,
-        .HAVE_MEMFD_CREATE = switch (os) {
-            .linux => true,
-            .freebsd => target.result.os.isAtLeast(.freebsd, .{ .major = 13, .minor = 0, .patch = 0 }) orelse false,
+        .HAVE_MKOSTEMP = opt(
+            if (target.result.isMuslLibC())
+                true
+            else if (target.result.isGnuLibC())
+                target.result.os.version_range.linux.glibc.order(.{
+                    .major = 2,
+                    .minor = 7,
+                    .patch = 0,
+                }) != .lt
+            else
+                true,
+        ),
+        .HAVE_POSIX_FALLOCATE = opt(os != .openbsd),
+        .HAVE_MEMFD_CREATE = opt(switch (os) {
+            .linux => if (target.result.isMuslLibC())
+                true
+            else if (target.result.isGnuLibC())
+                target.result.os.version_range.linux.glibc.order(.{
+                    .major = 2,
+                    .minor = 27,
+                    .patch = 0,
+                }) != .lt
+            else
+                true,
+            .freebsd => target.result.os.isAtLeast(.freebsd, .{
+                .major = 13,
+                .minor = 0,
+                .patch = 0,
+            }) orelse false,
             else => false,
-        },
-        .HAVE_MREMAP = is_linux or is_freebsd,
+        }),
+        .HAVE_MREMAP = opt(os == .linux or os == .freebsd),
         .HAVE_STRNDUP = true,
-        .HAVE_PRCTL = is_linux,
-        .HAVE_XUCRED_CR_PID = false,
-        .HAVE_BROKEN_MSG_CMSG_CLOEXEC = false,
+        .HAVE_PRCTL = opt(os == .linux),
     });
-
-    // Convert false values to undef (required for #ifdef guards in the C code)
-    for (config_h.values.values()) |*entry| {
-        if (entry.* == .boolean and !entry.boolean) entry.* = .undef;
-    }
-
-    // connection.c and wayland-os.c use #include "../config.h" — place config.h
-    // so the relative include resolves via -I path.
-    const config_wf = b.addWriteFiles();
-    _ = config_wf.addCopyFile(config_h.getOutputFile(), "config.h");
-    const config_subdir = config_wf.addCopyFile(config_h.getOutputFile(), "config/config.h");
 
     const version_h = b.addConfigHeader(.{
         .style = .{ .autoconf_at = upstream.path("src/wayland-version.h.in") },
@@ -69,226 +125,251 @@ pub fn build(b: *std.Build) void {
         .WAYLAND_VERSION = manifest.version,
     });
 
-    // ── wayland-util (shared between scanner + all libs) ─────────────
+    // wayland-util (target + host)
+    const wayland_util = b.addLibrary(.{
+        .linkage = .static,
+        .name = "wayland-util",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const wayland_util_host = b.addLibrary(.{
+        .linkage = .static,
+        .name = "wayland-util",
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    for ([_]struct { *Compile, []const []const u8 }{
+        .{ wayland_util, flags },
+        .{ wayland_util_host, host_flags },
+    }) |lib_flags| {
+        const lib, const f = lib_flags;
+        lib.installHeader(upstream.path("src/wayland-util.h"), "wayland-util.h");
+        lib.root_module.addCSourceFile(.{ .file = upstream.path("src/wayland-util.c"), .flags = f });
+    }
 
-    const wayland_util = createWaylandUtil(b, target, optimize, upstream, cc_flags);
-    const wayland_util_host = createWaylandUtil(b, b.graph.host, optimize, upstream, host_cc_flags);
+    // Upstream sources use `#include "../config.h"`, so config.h must be in a parent
+    // directory relative to the include path. Place it at both `config.h` and `config/config.h`
+    // so that `config/` can be added as an include path making `../config.h` resolve.
+    const config_wf = b.addWriteFiles();
+    _ = config_wf.addCopyFile(config_h.getOutputFile(), "config.h");
+    const config_subdir = config_wf.addCopyFile(config_h.getOutputFile(), "config/config.h");
 
-    // ── wayland-private (connection.c + wayland-os.c) ────────────────
-
+    // wayland-private
     const wayland_private = b.addLibrary(.{
         .linkage = .static,
         .name = "wayland-private",
-        .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
     });
     wayland_private.root_module.addIncludePath(config_subdir.dirname());
     wayland_private.root_module.addIncludePath(upstream.path(""));
     wayland_private.root_module.addCSourceFiles(.{
         .root = upstream.path("src"),
         .files = &.{ "connection.c", "wayland-os.c" },
-        .flags = cc_flags,
+        .flags = flags,
     });
-    wayland_private.root_module.linkLibrary(libffi_dep.artifact("ffi"));
-    if (is_bsd) linkEpollShim(b, wayland_private.root_module, target, optimize);
 
-    // ── Scanner ──────────────────────────────────────────────────────
-
-    var scanner_host: ?*std.Build.Step.Compile = null;
-
-    if (options.scanner) {
-        const scanner = b.addExecutable(.{
+    // wayland-scanner
+    const scanner_host: ?*Compile = if (options.scanner) scanner: {
+        const s = b.addExecutable(.{
             .name = "wayland-scanner",
-            .root_module = b.createModule(.{ .target = b.graph.host, .optimize = optimize, .link_libc = true }),
+            .root_module = b.createModule(.{
+                .target = b.graph.host,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
         });
-        scanner.root_module.addConfigHeader(version_h);
-        scanner.root_module.addIncludePath(upstream.path(""));
-        scanner.root_module.addIncludePath(upstream.path("protocol"));
-        scanner.root_module.addCSourceFile(.{ .file = upstream.path("src/scanner.c"), .flags = host_cc_flags });
-        scanner.root_module.linkLibrary(wayland_util_host);
-
-        if (b.lazyDependency("libexpat", .{ .target = b.graph.host, .optimize = optimize })) |expat|
-            scanner.root_module.linkLibrary(expat.artifact("expat"))
+        s.root_module.addConfigHeader(version_h);
+        s.root_module.addIncludePath(upstream.path(""));
+        s.root_module.addIncludePath(upstream.path("protocol"));
+        s.root_module.addCSourceFile(.{ .file = upstream.path("src/scanner.c"), .flags = host_flags });
+        s.root_module.linkLibrary(wayland_util_host);
+        if (pkgs.libexpat) |expat|
+            s.root_module.linkLibrary(expat.artifact("expat"))
         else
-            scanner.root_module.linkSystemLibrary("expat", .{});
-
+            s.root_module.linkSystemLibrary("expat", .{});
         if (options.@"dtd-validation") {
-            const embed_tool = b.addExecutable(.{
+            const embed = b.addRunArtifact(b.addExecutable(.{
                 .name = "embed",
-                .root_module = b.createModule(.{ .root_source_file = b.path("tools/embed.zig"), .target = b.graph.host }),
-            });
-            const embed_run = b.addRunArtifact(embed_tool);
-            embed_run.addArg("wayland_dtd");
-            embed_run.addFileArg(upstream.path("protocol/wayland.dtd"));
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("tools/embed.zig"),
+                    .target = b.graph.host,
+                }),
+            }));
+            embed.addArg("wayland_dtd");
+            embed.addFileArg(upstream.path("protocol/wayland.dtd"));
             const dtd_wf = b.addWriteFiles();
-            _ = dtd_wf.addCopyFile(embed_run.captureStdOut(.{}), "wayland.dtd.h");
-            scanner.root_module.addIncludePath(dtd_wf.getDirectory());
-
-            if (b.lazyDependency("libxml2", .{ .target = b.graph.host, .optimize = optimize, .minimum = true, .valid = true })) |libxml2|
-                scanner.root_module.linkLibrary(libxml2.artifact("xml"))
+            _ = dtd_wf.addCopyFile(embed.captureStdOut(.{}), "wayland.dtd.h");
+            s.root_module.addIncludePath(dtd_wf.getDirectory());
+            if (pkgs.libxml2) |xml2|
+                s.root_module.linkLibrary(xml2.artifact("xml"))
             else
-                scanner.root_module.linkSystemLibrary("libxml-2.0", .{});
-            scanner.root_module.addCMacro("HAVE_LIBXML", "1");
+                s.root_module.linkSystemLibrary("libxml-2.0", .{});
+            s.root_module.addCMacro("HAVE_LIBXML", "1");
         }
+        b.installArtifact(s);
+        break :scanner s;
+    } else null;
 
-        b.installArtifact(scanner);
-        scanner_host = scanner;
-    }
+    // Protocol generation
+    const xml = upstream.path("protocol/wayland.xml");
+    const server_h = scan(b, scanner_host, xml, &.{"server-header"}, "wayland-server-protocol.h");
+    const server_core_h = scan(b, scanner_host, xml, &.{ "server-header", "-c" }, "wayland-server-protocol-core.h");
+    const client_h = scan(b, scanner_host, xml, &.{"client-header"}, "wayland-client-protocol.h");
+    const client_core_h = scan(b, scanner_host, xml, &.{ "client-header", "-c" }, "wayland-client-protocol-core.h");
+    const proto_c = scan(b, scanner_host, xml, &.{"public-code"}, "wayland-protocol.c");
 
-    // ── Protocol generation ──────────────────────────────────────────
-
-    var server_proto_h: std.Build.LazyPath = undefined;
-    var server_proto_core_h: std.Build.LazyPath = undefined;
-    var client_proto_h: std.Build.LazyPath = undefined;
-    var client_proto_core_h: std.Build.LazyPath = undefined;
-    var proto_c: std.Build.LazyPath = undefined;
-
-    for (
-        [_][]const []const u8{ &.{"server-header"}, &.{ "server-header", "-c" }, &.{"client-header"}, &.{ "client-header", "-c" }, &.{"public-code"} },
-        [_][]const u8{ "wayland-server-protocol.h", "wayland-server-protocol-core.h", "wayland-client-protocol.h", "wayland-client-protocol-core.h", "wayland-protocol.c" },
-        [_]*std.Build.LazyPath{ &server_proto_h, &server_proto_core_h, &client_proto_h, &client_proto_core_h, &proto_c },
-    ) |scanner_args, basename, out| {
-        const run = if (scanner_host) |s| b.addRunArtifact(s) else b.addSystemCommand(&.{"wayland-scanner"});
-        run.addArg("-s");
-        run.addArgs(scanner_args);
-        run.addFileArg(upstream.path("protocol/wayland.xml"));
-        out.* = run.addOutputFileArg(basename);
-    }
-
-    // ── Libraries ────────────────────────────────────────────────────
-
-    // server
-    const wayland_server = b.addLibrary(.{
+    // Public libraries
+    const server = b.addLibrary(.{
         .linkage = options.linkage,
         .name = "wayland-server",
-        .version = .{ .major = 0, .minor = version.minor, .patch = version.patch },
-        .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
+        .version = soversion,
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
     });
-    wayland_server.root_module.linkLibrary(wayland_private);
-    wayland_server.root_module.linkLibrary(wayland_util);
-    wayland_server.root_module.addConfigHeader(version_h);
-    wayland_server.root_module.addConfigHeader(config_h);
-    wayland_server.root_module.addIncludePath(upstream.path("src"));
-    wayland_server.root_module.addIncludePath(server_proto_core_h.dirname());
-    wayland_server.root_module.addIncludePath(server_proto_h.dirname());
-    wayland_server.root_module.addCSourceFile(.{ .file = proto_c, .flags = cc_flags });
-    wayland_server.root_module.addCSourceFiles(.{ .root = upstream.path("src"), .files = &.{ "wayland-shm.c", "event-loop.c" }, .flags = cc_flags });
-    if (is_bsd) linkEpollShim(b, wayland_server.root_module, target, optimize);
-    wayland_server.root_module.linkLibrary(libffi_dep.artifact("ffi"));
-    wayland_server.installHeader(server_proto_core_h, "wayland-server-protocol-core.h");
-    wayland_server.installHeader(server_proto_h, "wayland-server-protocol.h");
-    wayland_server.installHeader(upstream.path("src/wayland-server.h"), "wayland-server.h");
-    wayland_server.installHeader(upstream.path("src/wayland-server-core.h"), "wayland-server-core.h");
-    wayland_server.installLibraryHeaders(wayland_util);
-    wayland_server.installConfigHeader(version_h);
-    b.installArtifact(wayland_server);
-
-    // client
-    const wayland_client = b.addLibrary(.{
+    const client = b.addLibrary(.{
         .linkage = options.linkage,
         .name = "wayland-client",
-        .version = .{ .major = 0, .minor = version.minor, .patch = version.patch },
-        .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
+        .version = soversion,
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
     });
-    wayland_client.root_module.linkLibrary(wayland_private);
-    wayland_client.root_module.linkLibrary(wayland_util);
-    wayland_client.root_module.addConfigHeader(version_h);
-    wayland_client.root_module.addConfigHeader(config_h);
-    wayland_client.root_module.addIncludePath(upstream.path("src"));
-    wayland_client.root_module.addIncludePath(client_proto_core_h.dirname());
-    wayland_client.root_module.addIncludePath(client_proto_h.dirname());
-    wayland_client.root_module.addCSourceFile(.{ .file = proto_c, .flags = cc_flags });
-    wayland_client.root_module.addCSourceFile(.{ .file = upstream.path("src/wayland-client.c"), .flags = cc_flags });
-    if (is_bsd) linkEpollShim(b, wayland_client.root_module, target, optimize);
-    wayland_client.root_module.linkLibrary(libffi_dep.artifact("ffi"));
-    wayland_client.installHeader(client_proto_core_h, "wayland-client-protocol-core.h");
-    wayland_client.installHeader(client_proto_h, "wayland-client-protocol.h");
-    wayland_client.installHeader(upstream.path("src/wayland-client.h"), "wayland-client.h");
-    wayland_client.installHeader(upstream.path("src/wayland-client-core.h"), "wayland-client-core.h");
-    wayland_client.installLibraryHeaders(wayland_util);
-    wayland_client.installConfigHeader(version_h);
-    b.installArtifact(wayland_client);
-
-    // egl
-    const wayland_egl = b.addLibrary(.{
+    const egl = b.addLibrary(.{
         .linkage = options.linkage,
         .name = "wayland-egl",
         .version = version,
-        .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
     });
-    wayland_egl.root_module.linkLibrary(wayland_client);
-    wayland_egl.root_module.addConfigHeader(version_h);
-    wayland_egl.root_module.addConfigHeader(config_h);
-    wayland_egl.root_module.addIncludePath(client_proto_core_h.dirname());
-    wayland_egl.root_module.addIncludePath(client_proto_h.dirname());
-    wayland_egl.root_module.addCSourceFile(.{ .file = upstream.path("egl/wayland-egl.c"), .flags = cc_flags });
-    inline for (.{ "egl/wayland-egl.h", "egl/wayland-egl-core.h", "egl/wayland-egl-backend.h" }) |h|
-        wayland_egl.installHeader(upstream.path(h), std.fs.path.basename(h));
-    b.installArtifact(wayland_egl);
-
-    // cursor
-    const wayland_cursor = b.addLibrary(.{
+    const cursor = b.addLibrary(.{
         .linkage = options.linkage,
         .name = "wayland-cursor",
-        .version = .{ .major = 0, .minor = version.minor, .patch = version.patch },
-        .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
+        .version = soversion,
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
     });
-    wayland_cursor.root_module.linkLibrary(wayland_client);
-    wayland_cursor.root_module.addConfigHeader(version_h);
-    wayland_cursor.root_module.addConfigHeader(config_h);
-    wayland_cursor.root_module.addIncludePath(client_proto_core_h.dirname());
-    wayland_cursor.root_module.addIncludePath(client_proto_h.dirname());
-    if (options.icon_directory) |dir| wayland_cursor.root_module.addCMacro("ICONDIR", dir);
-    wayland_cursor.root_module.addCSourceFiles(.{
+
+    // Common includes for all public libraries
+    for ([_]*Compile{ server, client, egl, cursor }) |lib| {
+        lib.root_module.addConfigHeader(version_h);
+        lib.root_module.addConfigHeader(config_h);
+        lib.root_module.addIncludePath(upstream.path("src"));
+    }
+
+    // Server/client use server-side proto headers; egl/cursor use client-side
+    for ([_]*Compile{server}) |lib| {
+        lib.root_module.addIncludePath(server_core_h.dirname());
+        lib.root_module.addIncludePath(server_h.dirname());
+    }
+    for ([_]*Compile{ client, egl, cursor }) |lib| {
+        lib.root_module.addIncludePath(client_core_h.dirname());
+        lib.root_module.addIncludePath(client_h.dirname());
+    }
+
+    // Common deps (libffi, rt, epoll-shim)
+    for ([_]*Module{ wayland_private.root_module, server.root_module, client.root_module }) |mod| {
+        if (pkgs.libffi) |dep|
+            mod.linkLibrary(dep.artifact("ffi"))
+        else
+            mod.linkSystemLibrary("libffi", .{});
+
+        if (os == .linux or os == .freebsd) mod.linkSystemLibrary("rt", .{});
+
+        if (os.isBSD()) {
+            if (pkgs.epoll_shim) |dep|
+                mod.linkLibrary(dep.artifact("epoll-shim"))
+            else
+                mod.linkSystemLibrary("epoll-shim", .{});
+        }
+    }
+
+    // wayland-server
+    server.root_module.linkLibrary(wayland_private);
+    server.root_module.linkLibrary(wayland_util);
+    server.root_module.addCSourceFile(.{ .file = proto_c, .flags = flags });
+    server.root_module.addCSourceFiles(.{
+        .root = upstream.path("src"),
+        .files = &.{ "wayland-shm.c", "event-loop.c" },
+        .flags = flags,
+    });
+    server.installHeader(server_core_h, "wayland-server-protocol-core.h");
+    server.installHeader(server_h, "wayland-server-protocol.h");
+    inline for (.{ "src/wayland-server.h", "src/wayland-server-core.h" }) |h|
+        server.installHeader(upstream.path(h), path.basename(h));
+    server.installLibraryHeaders(wayland_util);
+    server.installConfigHeader(version_h);
+    b.installArtifact(server);
+
+    // wayland-client
+    client.root_module.linkLibrary(wayland_private);
+    client.root_module.linkLibrary(wayland_util);
+    client.root_module.addCSourceFile(.{ .file = proto_c, .flags = flags });
+    client.root_module.addCSourceFile(.{
+        .file = upstream.path("src/wayland-client.c"),
+        .flags = flags,
+    });
+    client.installHeader(client_core_h, "wayland-client-protocol-core.h");
+    client.installHeader(client_h, "wayland-client-protocol.h");
+    inline for (.{ "src/wayland-client.h", "src/wayland-client-core.h" }) |h|
+        client.installHeader(upstream.path(h), path.basename(h));
+    client.installLibraryHeaders(wayland_util);
+    client.installConfigHeader(version_h);
+    b.installArtifact(client);
+
+    // wayland-egl
+    egl.root_module.linkLibrary(client);
+    egl.root_module.addCSourceFile(.{
+        .file = upstream.path("egl/wayland-egl.c"),
+        .flags = flags,
+    });
+    inline for (.{ "egl/wayland-egl.h", "egl/wayland-egl-core.h", "egl/wayland-egl-backend.h" }) |h|
+        egl.installHeader(upstream.path(h), path.basename(h));
+    b.installArtifact(egl);
+
+    // wayland-cursor
+    cursor.root_module.linkLibrary(client);
+    if (options.icon_directory) |dir| cursor.root_module.addCMacro("ICONDIR", dir);
+    cursor.root_module.addCSourceFiles(.{
         .root = upstream.path("cursor"),
         .files = &.{ "wayland-cursor.c", "os-compatibility.c", "xcursor.c" },
-        .flags = cc_flags,
+        .flags = flags,
     });
-    wayland_cursor.installHeader(upstream.path("cursor/wayland-cursor.h"), "wayland-cursor.h");
-    b.installArtifact(wayland_cursor);
+    cursor.installHeader(upstream.path("cursor/wayland-cursor.h"), "wayland-cursor.h");
+    b.installArtifact(cursor);
 
     b.addNamedLazyPath("wayland-xml", upstream.path("protocol/wayland.xml"));
     b.addNamedLazyPath("wayland.dtd", upstream.path("protocol/wayland.dtd"));
 }
 
-fn createWaylandUtil(
-    b: *std.Build,
-    t: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    upstream: *std.Build.Dependency,
-    cc_flags: []const []const u8,
-) *std.Build.Step.Compile {
-    const lib = b.addLibrary(.{
-        .linkage = .static,
-        .name = "wayland-util",
-        .root_module = b.createModule(.{ .target = t, .optimize = optimize, .link_libc = true }),
-    });
-    lib.installHeader(upstream.path("src/wayland-util.h"), "wayland-util.h");
-    lib.root_module.addCSourceFile(.{ .file = upstream.path("src/wayland-util.c"), .flags = cc_flags });
-    return lib;
+inline fn opt(v: bool) ?bool {
+    return if (v) true else null;
 }
 
-fn linkEpollShim(b: *std.Build, mod: *std.Build.Module, t: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
-    if (b.lazyDependency("epoll_shim", .{ .target = t, .optimize = optimize })) |dep|
-        mod.linkLibrary(dep.artifact("epoll-shim"))
-    else
-        mod.linkSystemLibrary("epoll-shim", .{});
-}
-
-fn getCCFlags(b: *std.Build, t: std.Build.ResolvedTarget) []const []const u8 {
-    var list: std.ArrayListUnmanaged([]const u8) = .{};
-    list.appendSlice(b.allocator, &.{
-        "-std=c99",            "-Wno-unused-parameter",
-        "-Wstrict-prototypes", "-Wmissing-prototypes",
-        "-fvisibility=hidden",
-    }) catch @panic("OOM");
-    switch (t.result.os.tag) {
-        .freebsd, .openbsd => {},
-        else => list.append(b.allocator, "-D_POSIX_C_SOURCE=200809L") catch @panic("OOM"),
-    }
-    return list.items;
-}
-
-comptime {
-    if (version.major != 1)
-        @compileError("SONAME bump needed for libwayland-server, -client, -cursor");
+fn scan(b_: *std.Build, sc: ?*Compile, xml: LazyPath, args: []const []const u8, name: []const u8) LazyPath {
+    const run = if (sc) |s| b_.addRunArtifact(s) else b_.addSystemCommand(&.{"wayland-scanner"});
+    run.addArg("-s");
+    run.addArgs(args);
+    run.addFileArg(xml);
+    return run.addOutputFileArg(name);
 }

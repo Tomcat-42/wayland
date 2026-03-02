@@ -1,24 +1,33 @@
 .{
     .name = .wayland,
     .version = "1.24.0",
-    .fingerprint = 0xa8d655eae909fe1,
-    .minimum_zig_version = "0.16.0-dev.2535+b5bd49460",
     .dependencies = .{
-        .libffi = .{
-            .url = "https://github.com/allyourcodebase/libffi/archive/refs/tags/v3.5.2.tar.gz",
-            .hash = "libffi-3.5.2-QhHaJ14TAADRonPOrcnDENKGBp8n7fFwV66XkF8xYJ8J",
-        },
-        .libexpat = .{ .path = "../libexpat", .lazy = true },
-        .libxml2 = .{ .path = "../libxml2", .lazy = true },
-        .epoll_shim = .{
-            .url = "https://github.com/allyourcodebase/epoll-shim/archive/refs/tags/v0.0.20240608.tar.gz",
-            .hash = "epoll_shim-0.0.20240608-F353TAwYAADuv8WKH14sMnMpwxCf-WLRPKbPgBPZRusk",
-            .lazy = true,
-        },
-        .upstream = .{
+        .wayland_c = .{
             .url = "https://gitlab.freedesktop.org/wayland/wayland/-/archive/1.24.0/wayland-1.24.0.tar.gz",
             .hash = "N-V-__8AAGoeGQBEn6KguTJUXrCE0tIRrrXfQX7hYHoKCJwZ",
         },
+        .libffi = .{
+            .url = "https://github.com/allyourcodebase/libffi/archive/refs/tags/v3.5.2.tar.gz",
+            .hash = "libffi-3.5.2-QhHaJyYYAAA1JzdzpVppCdz543jMEJGazBWhRR_FMvRg",
+            .lazy = true,
+        },
+        .libexpat = .{
+            .url = "https://github.com/Tomcat-42/libexpat/archive/refs/tags/v2.7.4.tar.gz",
+            .hash = "libexpat-2.7.4-QpCA3xwPAADHIYpQeadIwxnoHqBo8CwgiNfecY_eEGSB",
+            .lazy = true,
+        },
+        .libxml2 = .{
+            .url = "https://github.com/Tomcat-42/libxml2/archive/refs/tags/v2.15.1.tar.gz",
+            .hash = "libxml2-2.15.1-v2xWRgYqAADgA7GlPCyV4gV7h5SQNtSTKOlO64eL8Zbx",
+            .lazy = true,
+        },
+        .epoll_shim = .{
+            .url = "https://github.com/allyourcodebase/epoll-shim/archive/refs/tags/v0.0.20240608.tar.gz",
+            .hash = "epoll_shim-0.0.20240608-F353TPwXAABFkykwyzxbQ0VqWalptsK-35h8Ya9SLGl-",
+            .lazy = true,
+        },
     },
+    .minimum_zig_version = "0.16.0-dev.2535+b5bd49460",
     .paths = .{ "build.zig", "build.zig.zon", "tools", "README.md", "LICENSE" },
+    .fingerprint = 0xa8d655eae909fe1,
 }
